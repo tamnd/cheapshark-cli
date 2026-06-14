@@ -1,0 +1,10 @@
+title       = "cheapshark"
+baseURL     = "https://cheapshark-cli.tamnd.com/"
+description = "A command line for cheapshark."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/cheapshark-cli"

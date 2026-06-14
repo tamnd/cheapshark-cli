@@ -1,38 +1,72 @@
 // Package cheapshark is the library behind the cheapshark command line:
-// the HTTP client, request shaping, and the typed data models for cheapshark.
+// the HTTP client, request shaping, and the typed data models for the
+// CheapShark PC game deal price aggregator API.
 //
 // The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// User-Agent, paces requests, and retries transient failures (429 and 5xx).
 package cheapshark
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to cheapshark. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "cheapshark/dev (+https://github.com/tamnd/cheapshark-cli)"
+// DefaultUserAgent identifies the client to CheapShark.
+const DefaultUserAgent = "cheapshark-cli/0.1 (tamnd87@gmail.com)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at cheapshark.com; change it once you
-// know the real endpoints you want to read.
+// Host is the site this client talks to.
 const Host = "cheapshark.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// Config holds the tunables for a Client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+	UserAgent string
+}
 
-// Client talks to cheapshark over HTTP.
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://www.cheapshark.com",
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
+		Timeout:   15 * time.Second,
+		UserAgent: DefaultUserAgent,
+	}
+}
+
+// storeNames maps the common CheapShark storeIDs to human-readable names.
+var storeNames = map[string]string{
+	"1":  "Steam",
+	"2":  "GamersGate",
+	"3":  "GreenManGaming",
+	"7":  "GOG",
+	"11": "Humble",
+	"13": "Fanatical",
+	"25": "Epic Games",
+}
+
+// storeName returns the display name for a storeID, falling back to the ID itself.
+func storeName(id string) string {
+	if name, ok := storeNames[id]; ok {
+		return name
+	}
+	return id
+}
+
+// Client talks to the CheapShark API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +74,260 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with DefaultConfig values.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// --- wire types (match CheapShark JSON keys exactly) ---
+
+type wireDeal struct {
+	Title       string `json:"title"`
+	DealID      string `json:"dealID"`
+	StoreID     string `json:"storeID"`
+	GameID      string `json:"gameID"`
+	SalePrice   string `json:"salePrice"`
+	NormalPrice string `json:"normalPrice"`
+	Savings     string `json:"savings"`
+	DealRating  string `json:"dealRating"`
+}
+
+type wireStore struct {
+	StoreID   string `json:"storeID"`
+	StoreName string `json:"storeName"`
+	IsActive  int    `json:"isActive"`
+}
+
+type wireGameResult struct {
+	GameID   string `json:"gameID"`
+	External string `json:"external"`
+	Cheapest string `json:"cheapest"`
+}
+
+type wireGameInfo struct {
+	Title     string `json:"title"`
+	SteamAppID string `json:"steamAppID"`
+}
+
+type wireGameDeal struct {
+	StoreID     string `json:"storeID"`
+	DealID      string `json:"dealID"`
+	Price       string `json:"price"`
+	RetailPrice string `json:"retailPrice"`
+	Savings     string `json:"savings"`
+}
+
+type wireGameDetails struct {
+	Info             wireGameInfo   `json:"info"`
+	CheapestPriceEver struct {
+		Price string `json:"price"`
+		Date  int64  `json:"date"`
+	} `json:"cheapestPriceEver"`
+	Deals []wireGameDeal `json:"deals"`
+}
+
+// --- public output types ---
+
+// Deal is a single game deal from the CheapShark /deals endpoint.
+type Deal struct {
+	Title   string `kit:"id" json:"title"`
+	Store   string `json:"store"`
+	Sale    string `json:"sale_price"`
+	Normal  string `json:"normal_price"`
+	Savings string `json:"savings_pct"`
+	Rating  string `json:"rating"`
+	DealID  string `json:"deal_id"`
+}
+
+// GameResult is one entry from the CheapShark /games search endpoint.
+type GameResult struct {
+	GameID   string `kit:"id" json:"game_id"`
+	Title    string `json:"title"`
+	Cheapest string `json:"cheapest"`
+}
+
+// GameDeal is one deal from a game's detail page.
+type GameDeal struct {
+	Title   string `kit:"id" json:"title"`
+	Store   string `json:"store"`
+	Price   string `json:"price"`
+	Retail  string `json:"retail"`
+	Savings string `json:"savings_pct"`
+	DealID  string `json:"deal_id"`
+}
+
+// Store is one store from the CheapShark /stores endpoint.
+type Store struct {
+	ID     string `kit:"id" json:"id"`
+	Name   string `json:"name"`
+	Active bool   `json:"active"`
+}
+
+// --- client methods ---
+
+// ListDeals returns deals sorted and filtered per the given parameters.
+// storeID "" omits the storeID filter. sortBy defaults to "Recent".
+func (c *Client) ListDeals(ctx context.Context, storeID, sortBy string, limit int) ([]Deal, error) {
+	q := url.Values{}
+	if storeID != "" {
+		q.Set("storeID", storeID)
+	}
+	if sortBy != "" {
+		q.Set("sortBy", sortBy)
+	}
+	if limit > 0 {
+		q.Set("pageSize", strconv.Itoa(limit))
+	}
+
+	raw, err := c.Get(ctx, c.BaseURL+"/api/1.0/deals?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	var wire []wireDeal
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, fmt.Errorf("cheapshark deals decode: %w", err)
+	}
+
+	out := make([]Deal, len(wire))
+	for i, w := range wire {
+		sav := formatSavings(w.Savings)
+		out[i] = Deal{
+			Title:   w.Title,
+			Store:   storeName(w.StoreID),
+			Sale:    w.SalePrice,
+			Normal:  w.NormalPrice,
+			Savings: sav,
+			Rating:  w.DealRating,
+			DealID:  w.DealID,
+		}
+	}
+	return out, nil
+}
+
+// SearchGames searches games by title.
+// The CheapShark API returns an array of game stubs.
+func (c *Client) SearchGames(ctx context.Context, title string, limit int) ([]GameResult, error) {
+	q := url.Values{}
+	q.Set("title", title)
+	q.Set("exact", "0")
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+
+	raw, err := c.Get(ctx, c.BaseURL+"/api/1.0/games?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	// The API returns an array for title search.
+	if len(raw) > 0 && raw[0] == '[' {
+		var wire []wireGameResult
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			return nil, fmt.Errorf("cheapshark games decode: %w", err)
+		}
+		out := make([]GameResult, len(wire))
+		for i, w := range wire {
+			out[i] = GameResult{
+				GameID:   w.GameID,
+				Title:    w.External,
+				Cheapest: w.Cheapest,
+			}
+		}
+		return out, nil
+	}
+
+	// Fall back to map form (documented format, keys = gameIDs).
+	var wire map[string]wireGameResult
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, fmt.Errorf("cheapshark games decode: %w", err)
+	}
+	out := make([]GameResult, 0, len(wire))
+	for _, w := range wire {
+		out = append(out, GameResult{
+			GameID:   w.GameID,
+			Title:    w.External,
+			Cheapest: w.Cheapest,
+		})
+	}
+	return out, nil
+}
+
+// GetGame returns all deals for a single game by its CheapShark game ID.
+func (c *Client) GetGame(ctx context.Context, gameID string) ([]GameDeal, error) {
+	raw, err := c.Get(ctx, c.BaseURL+"/api/1.0/games?id="+url.QueryEscape(gameID))
+	if err != nil {
+		return nil, err
+	}
+
+	var wire wireGameDetails
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, fmt.Errorf("cheapshark game decode: %w", err)
+	}
+
+	title := wire.Info.Title
+	out := make([]GameDeal, len(wire.Deals))
+	for i, d := range wire.Deals {
+		out[i] = GameDeal{
+			Title:   title,
+			Store:   storeName(d.StoreID),
+			Price:   d.Price,
+			Retail:  d.RetailPrice,
+			Savings: formatSavings(d.Savings),
+			DealID:  d.DealID,
+		}
+	}
+	return out, nil
+}
+
+// ListStores returns all stores known to CheapShark. Active-only filtering
+// is done by the caller.
+func (c *Client) ListStores(ctx context.Context) ([]Store, error) {
+	raw, err := c.Get(ctx, c.BaseURL+"/api/1.0/stores")
+	if err != nil {
+		return nil, err
+	}
+
+	var wire []wireStore
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, fmt.Errorf("cheapshark stores decode: %w", err)
+	}
+
+	out := make([]Store, 0, len(wire))
+	for _, w := range wire {
+		if w.IsActive != 1 {
+			continue
+		}
+		out = append(out, Store{
+			ID:     w.StoreID,
+			Name:   w.StoreName,
+			Active: true,
+		})
+	}
+	return out, nil
+}
+
+// formatSavings turns a raw savings string like "60.024" into "60%".
+func formatSavings(s string) string {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return s
+	}
+	return fmt.Sprintf("%.0f%%", f)
+}
+
+// --- transport ---
+
+// Get fetches rawURL and returns the response body. It paces and retries
+// according to the client's settings.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +337,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +346,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -121,80 +394,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on cheapshark.com. It is a stand-in for the typed records you
-// will model from the real cheapshark endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `cheapshark cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

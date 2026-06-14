@@ -46,7 +46,7 @@ API key, nothing to run alongside it.`,
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// deals: browse current deals by store / price ceiling.
+	// deals: browse current deals, filtered by store and sorted as requested.
 	kit.Handle(app, kit.OpMeta{
 		Name:    "deals",
 		Group:   "read",
@@ -63,12 +63,21 @@ func (Domain) Register(app *kit.App) {
 		Args:    []kit.Arg{{Name: "title", Help: "game title to search for"}},
 	}, searchGames)
 
-	// stores: list all stores tracked by CheapShark.
+	// game: get all deals for a single game by its CheapShark game ID.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "game",
+		Group:   "read",
+		List:    true,
+		Summary: "Get deals for a game by ID",
+		Args:    []kit.Arg{{Name: "id", Help: "CheapShark game ID (from search)"}},
+	}, getGame)
+
+	// stores: list all active stores tracked by CheapShark.
 	kit.Handle(app, kit.OpMeta{
 		Name:    "stores",
 		Group:   "read",
 		List:    true,
-		Summary: "List all stores tracked by CheapShark",
+		Summary: "List all active stores tracked by CheapShark",
 	}, listStores)
 }
 
@@ -93,15 +102,20 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 // --- inputs ---
 
 type dealsInput struct {
-	Store    string  `kit:"flag" help:"store ID (default 1 = Steam)"`
-	MaxPrice float64 `kit:"flag" help:"upper price limit (0 = no limit)"`
-	Limit    int     `kit:"flag,inherit" help:"max results"`
-	Client   *Client `kit:"inject"`
+	Store  string `kit:"flag" help:"store ID to filter by (default: all stores)"`
+	Sort   string `kit:"flag" help:"sort order: Price, Title, DealRating, Savings, Recent"`
+	Limit  int    `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
 }
 
 type searchInput struct {
 	Title  string  `kit:"arg" help:"game title to search for"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type gameInput struct {
+	ID     string  `kit:"arg" help:"CheapShark game ID"`
 	Client *Client `kit:"inject"`
 }
 
@@ -112,15 +126,15 @@ type storesInput struct {
 // --- handlers ---
 
 func listDeals(ctx context.Context, in dealsInput, emit func(*Deal) error) error {
-	store := in.Store
-	if store == "" {
-		store = "1"
+	sort := in.Sort
+	if sort == "" {
+		sort = "Recent"
 	}
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 25
+		limit = 20
 	}
-	deals, err := in.Client.ListDeals(ctx, store, in.MaxPrice, limit)
+	deals, err := in.Client.ListDeals(ctx, in.Store, sort, limit)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -143,6 +157,19 @@ func searchGames(ctx context.Context, in searchInput, emit func(*GameResult) err
 	}
 	for i := range results {
 		if err := emit(&results[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getGame(ctx context.Context, in gameInput, emit func(*GameDeal) error) error {
+	deals, err := in.Client.GetGame(ctx, in.ID)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range deals {
+		if err := emit(&deals[i]); err != nil {
 			return err
 		}
 	}

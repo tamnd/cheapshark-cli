@@ -18,27 +18,48 @@ import (
 )
 
 // DefaultUserAgent identifies the client to CheapShark.
-const DefaultUserAgent = "cheapshark-cli/dev (+https://github.com/tamnd/cheapshark-cli)"
+const DefaultUserAgent = "cheapshark-cli/0.1 (tamnd87@gmail.com)"
 
 // Host is the site this client talks to.
 const Host = "cheapshark.com"
 
 // Config holds the tunables for a Client.
 type Config struct {
-	BaseURL string
-	Rate    time.Duration
-	Retries int
-	Timeout time.Duration
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+	UserAgent string
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		BaseURL: "https://www.cheapshark.com",
-		Rate:    0,
-		Retries: 3,
-		Timeout: 15 * time.Second,
+		BaseURL:   "https://www.cheapshark.com",
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
+		Timeout:   15 * time.Second,
+		UserAgent: DefaultUserAgent,
 	}
+}
+
+// storeNames maps the common CheapShark storeIDs to human-readable names.
+var storeNames = map[string]string{
+	"1":  "Steam",
+	"2":  "GamersGate",
+	"3":  "GreenManGaming",
+	"7":  "GOG",
+	"11": "Humble",
+	"13": "Fanatical",
+	"25": "Epic Games",
+}
+
+// storeName returns the display name for a storeID, falling back to the ID itself.
+func storeName(id string) string {
+	if name, ok := storeNames[id]; ok {
+		return name
+	}
+	return id
 }
 
 // Client talks to the CheapShark API over HTTP.
@@ -58,7 +79,7 @@ func NewClient() *Client {
 	cfg := DefaultConfig()
 	return &Client{
 		HTTP:      &http.Client{Timeout: cfg.Timeout},
-		UserAgent: DefaultUserAgent,
+		UserAgent: cfg.UserAgent,
 		BaseURL:   cfg.BaseURL,
 		Rate:      cfg.Rate,
 		Retries:   cfg.Retries,
@@ -75,8 +96,6 @@ type wireDeal struct {
 	SalePrice   string `json:"salePrice"`
 	NormalPrice string `json:"normalPrice"`
 	Savings     string `json:"savings"`
-	MetaScore   string `json:"metacriticScore"`
-	SteamAppID  string `json:"steamAppID"`
 	DealRating  string `json:"dealRating"`
 }
 
@@ -87,57 +106,85 @@ type wireStore struct {
 }
 
 type wireGameResult struct {
-	GameID     string `json:"gameID"`
+	GameID   string `json:"gameID"`
+	External string `json:"external"`
+	Cheapest string `json:"cheapest"`
+}
+
+type wireGameInfo struct {
+	Title     string `json:"title"`
 	SteamAppID string `json:"steamAppID"`
-	Cheapest   string `json:"cheapest"`
+}
+
+type wireGameDeal struct {
+	StoreID     string `json:"storeID"`
+	DealID      string `json:"dealID"`
+	Price       string `json:"price"`
+	RetailPrice string `json:"retailPrice"`
+	Savings     string `json:"savings"`
+}
+
+type wireGameDetails struct {
+	Info             wireGameInfo   `json:"info"`
+	CheapestPriceEver struct {
+		Price string `json:"price"`
+		Date  int64  `json:"date"`
+	} `json:"cheapestPriceEver"`
+	Deals []wireGameDeal `json:"deals"`
 }
 
 // --- public output types ---
 
 // Deal is a single game deal from the CheapShark /deals endpoint.
 type Deal struct {
-	Title       string `kit:"id" json:"title"`
-	StoreID     string `json:"store_id"`
-	SalePrice   string `json:"sale_price"`
-	NormalPrice string `json:"normal_price"`
-	Savings     string `json:"savings"`
-	DealID      string `json:"deal_id"`
-	GameID      string `json:"game_id"`
-	SteamAppID  string `json:"steam_app_id"`
-	Metacritic  string `json:"metacritic"`
-	DealRating  string `json:"deal_rating"`
+	Title   string `kit:"id" json:"title"`
+	Store   string `json:"store"`
+	Sale    string `json:"sale_price"`
+	Normal  string `json:"normal_price"`
+	Savings string `json:"savings_pct"`
+	Rating  string `json:"rating"`
+	DealID  string `json:"deal_id"`
 }
 
 // GameResult is one entry from the CheapShark /games search endpoint.
 type GameResult struct {
-	GameID     string `kit:"id" json:"game_id"`
-	SteamAppID string `json:"steam_app_id"`
-	Cheapest   string `json:"cheapest"`
+	GameID   string `kit:"id" json:"game_id"`
+	Title    string `json:"title"`
+	Cheapest string `json:"cheapest"`
+}
+
+// GameDeal is one deal from a game's detail page.
+type GameDeal struct {
+	Title   string `kit:"id" json:"title"`
+	Store   string `json:"store"`
+	Price   string `json:"price"`
+	Retail  string `json:"retail"`
+	Savings string `json:"savings_pct"`
+	DealID  string `json:"deal_id"`
 }
 
 // Store is one store from the CheapShark /stores endpoint.
 type Store struct {
-	StoreID   string `kit:"id" json:"store_id"`
-	StoreName string `json:"store_name"`
-	IsActive  int    `json:"is_active"`
+	ID     string `kit:"id" json:"id"`
+	Name   string `json:"name"`
+	Active bool   `json:"active"`
 }
 
 // --- client methods ---
 
-// ListDeals returns deals from the given store filtered by maxPrice (0 = no
-// filter). storeID "1" is Steam.
-func (c *Client) ListDeals(ctx context.Context, storeID string, maxPrice float64, limit int) ([]Deal, error) {
+// ListDeals returns deals sorted and filtered per the given parameters.
+// storeID "" omits the storeID filter. sortBy defaults to "Recent".
+func (c *Client) ListDeals(ctx context.Context, storeID, sortBy string, limit int) ([]Deal, error) {
 	q := url.Values{}
 	if storeID != "" {
 		q.Set("storeID", storeID)
 	}
-	if maxPrice > 0 {
-		q.Set("upperPrice", strconv.FormatFloat(maxPrice, 'f', 2, 64))
+	if sortBy != "" {
+		q.Set("sortBy", sortBy)
 	}
 	if limit > 0 {
 		q.Set("pageSize", strconv.Itoa(limit))
 	}
-	q.Set("pageNumber", "0")
 
 	raw, err := c.Get(ctx, c.BaseURL+"/api/1.0/deals?"+q.Encode())
 	if err != nil {
@@ -151,25 +198,22 @@ func (c *Client) ListDeals(ctx context.Context, storeID string, maxPrice float64
 
 	out := make([]Deal, len(wire))
 	for i, w := range wire {
+		sav := formatSavings(w.Savings)
 		out[i] = Deal{
-			Title:       w.Title,
-			StoreID:     w.StoreID,
-			SalePrice:   w.SalePrice,
-			NormalPrice: w.NormalPrice,
-			Savings:     w.Savings,
-			DealID:      w.DealID,
-			GameID:      w.GameID,
-			SteamAppID:  w.SteamAppID,
-			Metacritic:  w.MetaScore,
-			DealRating:  w.DealRating,
+			Title:   w.Title,
+			Store:   storeName(w.StoreID),
+			Sale:    w.SalePrice,
+			Normal:  w.NormalPrice,
+			Savings: sav,
+			Rating:  w.DealRating,
+			DealID:  w.DealID,
 		}
 	}
 	return out, nil
 }
 
 // SearchGames searches games by title.
-// The CheapShark API returns either an array or a map depending on the
-// query; we handle both formats.
+// The CheapShark API returns an array of game stubs.
 func (c *Client) SearchGames(ctx context.Context, title string, limit int) ([]GameResult, error) {
 	q := url.Values{}
 	q.Set("title", title)
@@ -183,7 +227,7 @@ func (c *Client) SearchGames(ctx context.Context, title string, limit int) ([]Ga
 		return nil, err
 	}
 
-	// Try array form first (actual API behavior for title search).
+	// The API returns an array for title search.
 	if len(raw) > 0 && raw[0] == '[' {
 		var wire []wireGameResult
 		if err := json.Unmarshal(raw, &wire); err != nil {
@@ -192,9 +236,9 @@ func (c *Client) SearchGames(ctx context.Context, title string, limit int) ([]Ga
 		out := make([]GameResult, len(wire))
 		for i, w := range wire {
 			out[i] = GameResult{
-				GameID:     w.GameID,
-				SteamAppID: w.SteamAppID,
-				Cheapest:   w.Cheapest,
+				GameID:   w.GameID,
+				Title:    w.External,
+				Cheapest: w.Cheapest,
 			}
 		}
 		return out, nil
@@ -208,15 +252,43 @@ func (c *Client) SearchGames(ctx context.Context, title string, limit int) ([]Ga
 	out := make([]GameResult, 0, len(wire))
 	for _, w := range wire {
 		out = append(out, GameResult{
-			GameID:     w.GameID,
-			SteamAppID: w.SteamAppID,
-			Cheapest:   w.Cheapest,
+			GameID:   w.GameID,
+			Title:    w.External,
+			Cheapest: w.Cheapest,
 		})
 	}
 	return out, nil
 }
 
-// ListStores returns all stores known to CheapShark.
+// GetGame returns all deals for a single game by its CheapShark game ID.
+func (c *Client) GetGame(ctx context.Context, gameID string) ([]GameDeal, error) {
+	raw, err := c.Get(ctx, c.BaseURL+"/api/1.0/games?id="+url.QueryEscape(gameID))
+	if err != nil {
+		return nil, err
+	}
+
+	var wire wireGameDetails
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, fmt.Errorf("cheapshark game decode: %w", err)
+	}
+
+	title := wire.Info.Title
+	out := make([]GameDeal, len(wire.Deals))
+	for i, d := range wire.Deals {
+		out[i] = GameDeal{
+			Title:   title,
+			Store:   storeName(d.StoreID),
+			Price:   d.Price,
+			Retail:  d.RetailPrice,
+			Savings: formatSavings(d.Savings),
+			DealID:  d.DealID,
+		}
+	}
+	return out, nil
+}
+
+// ListStores returns all stores known to CheapShark. Active-only filtering
+// is done by the caller.
 func (c *Client) ListStores(ctx context.Context) ([]Store, error) {
 	raw, err := c.Get(ctx, c.BaseURL+"/api/1.0/stores")
 	if err != nil {
@@ -228,20 +300,32 @@ func (c *Client) ListStores(ctx context.Context) ([]Store, error) {
 		return nil, fmt.Errorf("cheapshark stores decode: %w", err)
 	}
 
-	out := make([]Store, len(wire))
-	for i, w := range wire {
-		out[i] = Store{
-			StoreID:   w.StoreID,
-			StoreName: w.StoreName,
-			IsActive:  w.IsActive,
+	out := make([]Store, 0, len(wire))
+	for _, w := range wire {
+		if w.IsActive != 1 {
+			continue
 		}
+		out = append(out, Store{
+			ID:     w.StoreID,
+			Name:   w.StoreName,
+			Active: true,
+		})
 	}
 	return out, nil
 }
 
+// formatSavings turns a raw savings string like "60.024" into "60%".
+func formatSavings(s string) string {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return s
+	}
+	return fmt.Sprintf("%.0f%%", f)
+}
+
 // --- transport ---
 
-// Get fetches url and returns the response body. It paces and retries
+// Get fetches rawURL and returns the response body. It paces and retries
 // according to the client's settings.
 func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
